@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "eleveldb.h"
+#include "antidote.h"
 
 #include "leveldb/db.h"
 #include "leveldb/comparator.h"
@@ -137,6 +138,7 @@ ERL_NIF_TERM ATOM_DELETE_THRESHOLD;
 ERL_NIF_TERM ATOM_TIERED_SLOW_LEVEL;
 ERL_NIF_TERM ATOM_TIERED_FAST_PREFIX;
 ERL_NIF_TERM ATOM_TIERED_SLOW_PREFIX;
+ERL_NIF_TERM ATOM_ANTIDOTE;
 ERL_NIF_TERM ATOM_CACHE_OBJECT_WARMING;
 ERL_NIF_TERM ATOM_EXPIRY_ENABLED;
 ERL_NIF_TERM ATOM_EXPIRY_MINUTES;
@@ -475,6 +477,13 @@ ERL_NIF_TERM parse_open_option(ErlNifEnv* env, ERL_NIF_TERM item, leveldb::Optio
             if (0<ret_val && ret_val<256)
                 opts.tiered_slow_prefix = buffer;
         }
+        else if (option[0] == eleveldb::ATOM_ANTIDOTE)
+        {
+          if (option[1] == eleveldb::ATOM_TRUE)
+            {
+              opts.comparator = leveldb::GetAntidoteComparator();
+            }
+        }
         else if (option[0] == eleveldb::ATOM_CACHE_OBJECT_WARMING)
         {
             if (option[1] == eleveldb::ATOM_TRUE)
@@ -521,7 +530,6 @@ ERL_NIF_TERM parse_open_option(ErlNifEnv* env, ERL_NIF_TERM item, leveldb::Optio
                     ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->whole_file_expiry = false;
             }   // else
         }   // else if
-
     }
 
     return eleveldb::ATOM_OK;
@@ -1360,6 +1368,7 @@ try
     ATOM(eleveldb::ATOM_TIERED_SLOW_LEVEL, "tiered_slow_level");
     ATOM(eleveldb::ATOM_TIERED_FAST_PREFIX, "tiered_fast_prefix");
     ATOM(eleveldb::ATOM_TIERED_SLOW_PREFIX, "tiered_slow_prefix");
+    ATOM(eleveldb::ATOM_ANTIDOTE, "antidote");
     ATOM(eleveldb::ATOM_CACHE_OBJECT_WARMING, "cache_object_warming");
     ATOM(eleveldb::ATOM_EXPIRY_ENABLED, "expiry_enabled");
     ATOM(eleveldb::ATOM_EXPIRY_MINUTES, "expiry_minutes");
