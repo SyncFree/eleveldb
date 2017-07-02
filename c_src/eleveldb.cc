@@ -2,7 +2,7 @@
 //
 // eleveldb: Erlang Wrapper for LevelDB (http://code.google.com/p/leveldb/)
 //
-// Copyright (c) 2011-2016 Basho Technologies, Inc. All Rights Reserved.
+// Copyright (c) 2011-2017 Basho Technologies, Inc. All Rights Reserved.
 //
 // This file is provided to you under the Apache License,
 // Version 2.0 (the "License"); you may not use this file
@@ -38,6 +38,7 @@
 #include "leveldb/db.h"
 #include "leveldb/comparator.h"
 #include "leveldb/env.h"
+#include "leveldb/expiry.h"
 #include "leveldb/write_batch.h"
 #include "leveldb/cache.h"
 #include "leveldb/filter_policy.h"
@@ -48,6 +49,10 @@
 
 #ifndef INCL_WORKITEMS_H
     #include "workitems.h"
+#endif
+
+#ifndef INCL_ROUTER_H
+    #include "router.h"
 #endif
 
 #ifndef ATOMS_H
@@ -74,13 +79,21 @@ static ErlNifFunc nif_funcs[] =
     {"async_iterator", 3, eleveldb::async_iterator},
     {"async_iterator", 4, eleveldb::async_iterator},
 
-    {"async_iterator_move", 3, eleveldb::async_iterator_move}
+    {"async_iterator_move", 3, eleveldb::async_iterator_move},
+
+    {"property_cache", 2, eleveldb::property_cache},
+    {"property_cache_get", 1, eleveldb::property_cache_get},
+    {"property_cache_flush", 0, eleveldb::property_cache_flush},
+    {"set_metadata_pid", 2, eleveldb::set_metadata_pid},
+    {"remove_metadata_pid", 2, eleveldb::remove_metadata_pid},
+    {"get_metadata_pid", 1, eleveldb::get_metadata_pid}
 };
 
 
 namespace eleveldb {
 
 // Atoms (initialized in on_load)
+//   This is mirror of externs in atoms.h
 ERL_NIF_TERM ATOM_TRUE;
 ERL_NIF_TERM ATOM_FALSE;
 ERL_NIF_TERM ATOM_OK;
@@ -140,11 +153,24 @@ ERL_NIF_TERM ATOM_TIERED_FAST_PREFIX;
 ERL_NIF_TERM ATOM_TIERED_SLOW_PREFIX;
 ERL_NIF_TERM ATOM_ANTIDOTE;
 ERL_NIF_TERM ATOM_CACHE_OBJECT_WARMING;
+ERL_NIF_TERM ATOM_EXPIRATION;
+ERL_NIF_TERM ATOM_DEFAULT_TIME_TO_LIVE;
+ERL_NIF_TERM ATOM_EXPIRATION_MODE;
+ERL_NIF_TERM ATOM_ENABLED;
+ERL_NIF_TERM ATOM_WHOLE_FILE;
+ERL_NIF_TERM ATOM_PER_ITEM;
+ERL_NIF_TERM ATOM_INVOKE;
+ERL_NIF_TERM ATOM_UNLIMITED;
 ERL_NIF_TERM ATOM_EXPIRY_ENABLED;
 ERL_NIF_TERM ATOM_EXPIRY_MINUTES;
 ERL_NIF_TERM ATOM_WHOLE_FILE_EXPIRY;
-}   // namespace eleveldb
+ERL_NIF_TERM ATOM_BUCKET_PROPS;
 
+
+// defining ServiceCallback here in eleveldb.cc to guarantee initialization timing
+ServiceCallback gBucketPropCallback;
+
+}   // namespace eleveldb
 
 using std::nothrow;
 
@@ -176,6 +202,7 @@ static ERL_NIF_TERM slice_to_binary(ErlNifEnv* env, leveldb::Slice s)
     memcpy(value, s.data(), s.size());
     return result;
 }
+
 
 /** struct for grabbing eleveldb environment options via fold
  *   ... then loading said options into eleveldb_priv_data
@@ -229,11 +256,11 @@ public:
     leveldb::HotThreadPool thread_pool;
 
     explicit eleveldb_priv_data(EleveldbOptions & Options)
-    : m_Opts(Options),
-      thread_pool(Options.m_EleveldbThreads, "Eleveldb",
-                  leveldb::ePerfElevelDirect, leveldb::ePerfElevelQueued,
-                  leveldb::ePerfElevelDequeued, leveldb::ePerfElevelWeighted)
-        {}
+        : m_Opts(Options),
+          thread_pool(Options.m_EleveldbThreads, "Eleveldb",
+                      leveldb::ePerfElevelDirect, leveldb::ePerfElevelQueued,
+                      leveldb::ePerfElevelDequeued, leveldb::ePerfElevelWeighted)
+        {};
 
 private:
     eleveldb_priv_data();                                      // no default constructor
@@ -494,16 +521,18 @@ ERL_NIF_TERM parse_open_option(ErlNifEnv* env, ERL_NIF_TERM item, leveldb::Optio
 
         else if (option[0] == eleveldb::ATOM_EXPIRY_ENABLED)
         {
-            if (option[1] == eleveldb::ATOM_TRUE)
+            if (option[1] == eleveldb::ATOM_ENABLED
+                || option[1] == eleveldb::ATOM_ON
+                || option[1] == eleveldb::ATOM_TRUE)
             {
                 if (NULL==opts.expiry_module.get())
-                    opts.expiry_module.assign(leveldb::ExpiryModule::CreateExpiryModule());
-                ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->expiry_enabled = true;
+                    opts.expiry_module.assign(leveldb::ExpiryModule::CreateExpiryModule(&eleveldb::leveldb_callback));
+                ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->SetExpiryEnabled(true);
             }   // if
             else
             {
                 if (NULL!=opts.expiry_module.get())
-                    ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->expiry_enabled = false;
+                    ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->SetExpiryEnabled(false);
             }   // else
         }   // else if
         else if (option[0] == eleveldb::ATOM_EXPIRY_MINUTES)
@@ -512,23 +541,31 @@ ERL_NIF_TERM parse_open_option(ErlNifEnv* env, ERL_NIF_TERM item, leveldb::Optio
             if (enif_get_ulong(env, option[1], &minutes))
             {
                 if (NULL==opts.expiry_module.get())
-                    opts.expiry_module.assign(leveldb::ExpiryModule::CreateExpiryModule());
-                ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->expiry_minutes = minutes;
+                    opts.expiry_module.assign(leveldb::ExpiryModule::CreateExpiryModule(&eleveldb::leveldb_callback));
+                ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->SetExpiryMinutes(minutes);
             }   // if
+            else if (option[1] == eleveldb::ATOM_UNLIMITED)
+            {
+                if (NULL==opts.expiry_module.get())
+                    opts.expiry_module.assign(leveldb::ExpiryModule::CreateExpiryModule(&eleveldb::leveldb_callback));
+                ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->SetExpiryUnlimited(true);
+            }   // else if
+
         }   // else if
         else if (option[0] == eleveldb::ATOM_WHOLE_FILE_EXPIRY)
         {
-            if (option[1] == eleveldb::ATOM_TRUE)
+            if (option[1] == eleveldb::ATOM_WHOLE_FILE)
             {
                 if (NULL==opts.expiry_module.get())
-                    opts.expiry_module.assign(leveldb::ExpiryModule::CreateExpiryModule());
-                ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->whole_file_expiry = true;
+                    opts.expiry_module.assign(leveldb::ExpiryModule::CreateExpiryModule(&eleveldb::leveldb_callback));
+                ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->SetWholeFileExpiryEnabled(true);
             }   // if
-            else
+            else if (option[1] == eleveldb::ATOM_PER_ITEM)
             {
                 if (NULL!=opts.expiry_module.get())
-                    ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->whole_file_expiry = false;
-            }   // else
+                    ((leveldb::ExpiryModuleOS *)opts.expiry_module.get())->SetWholeFileExpiryEnabled(false);
+            }   // else if
+            // else take default setting ... do nothing.
         }   // else if
     }
 
@@ -620,6 +657,21 @@ ERL_NIF_TERM send_reply(ErlNifEnv *env, ERL_NIF_TERM ref, ERL_NIF_TERM reply)
     return ATOM_OK;
 }
 
+// Boilerplate for submitting to the thread queue.
+// Takes ownership of the item. assumes allocated through new
+
+ERL_NIF_TERM
+submit_to_thread_queue(eleveldb::WorkTask *work_item, ErlNifEnv* env, ERL_NIF_TERM caller_ref){
+    eleveldb_priv_data& data = *static_cast<eleveldb_priv_data *>(enif_priv_data(env));
+    if(false == data.thread_pool.Submit(work_item))
+    {
+        delete work_item;
+        return send_reply(env, caller_ref,
+                          enif_make_tuple2(env, eleveldb::ATOM_ERROR, caller_ref));
+    }   // if
+    return eleveldb::ATOM_OK;
+}
+
 ERL_NIF_TERM
 async_open(
     ErlNifEnv* env,
@@ -674,15 +726,7 @@ async_open(
 
     eleveldb::WorkTask *work_item = new eleveldb::OpenTask(env, caller_ref,
                                                               db_name, opts);
-
-    if(false == priv.thread_pool.Submit(work_item))
-    {
-        delete work_item;
-        return send_reply(env, caller_ref,
-                          enif_make_tuple2(env, eleveldb::ATOM_ERROR, caller_ref));
-    }
-
-    return eleveldb::ATOM_OK;
+    return submit_to_thread_queue(work_item, env, caller_ref);
 
 }   // async_open
 
@@ -713,8 +757,6 @@ async_write(
     if(NULL == db_ptr->m_Db)
         return send_reply(env, caller_ref, error_einval(env));
 
-    eleveldb_priv_data& priv = *static_cast<eleveldb_priv_data *>(enif_priv_data(env));
-
     // Construct a write batch:
     leveldb::WriteBatch* batch = new leveldb::WriteBatch;
 
@@ -736,16 +778,7 @@ async_write(
 
     eleveldb::WorkTask* work_item = new eleveldb::WriteTask(env, caller_ref,
                                                             db_ptr, batch, opts);
-
-    if(false == priv.thread_pool.Submit(work_item))
-    {
-        // work_item contains "batch" and the delete below gets both memory allocations
-        delete work_item;
-        return send_reply(env, caller_ref,
-                          enif_make_tuple2(env, eleveldb::ATOM_ERROR, caller_ref));
-    }   // if
-
-    return eleveldb::ATOM_OK;
+    return submit_to_thread_queue(work_item, env, caller_ref);
 }
 
 
@@ -779,17 +812,7 @@ async_get(
 
     eleveldb::WorkTask *work_item = new eleveldb::GetTask(env, caller_ref,
                                                           db_ptr, key_ref, opts);
-
-    eleveldb_priv_data& priv = *static_cast<eleveldb_priv_data *>(enif_priv_data(env));
-
-    if(false == priv.thread_pool.Submit(work_item))
-    {
-        delete work_item;
-        return send_reply(env, caller_ref,
-                          enif_make_tuple2(env, eleveldb::ATOM_ERROR, caller_ref));
-    }   // if
-
-    return eleveldb::ATOM_OK;
+    return submit_to_thread_queue(work_item, env, caller_ref);
 
 }   // async_get
 
@@ -826,18 +849,7 @@ async_iterator(
 
     eleveldb::WorkTask *work_item = new eleveldb::IterTask(env, caller_ref,
                                                            db_ptr, keys_only, opts);
-
-    // Now-boilerplate setup (we'll consolidate this pattern soon, I hope):
-    eleveldb_priv_data& priv = *static_cast<eleveldb_priv_data *>(enif_priv_data(env));
-
-    if(false == priv.thread_pool.Submit(work_item))
-    {
-        delete work_item;
-        return send_reply(env, caller_ref, enif_make_tuple2(env, ATOM_ERROR, caller_ref));
-    }   // if
-
-    return ATOM_OK;
-
+    return submit_to_thread_queue(work_item, env, caller_ref);
 }   // async_iterator
 
 
@@ -1058,15 +1070,8 @@ async_close(
     {
         eleveldb::WorkTask *work_item = new eleveldb::CloseTask(env, caller_ref,
                                                                 db_ptr);
+        return submit_to_thread_queue(work_item, env, caller_ref);
 
-        // Now-boilerplate setup (we'll consolidate this pattern soon, I hope):
-        eleveldb_priv_data& priv = *static_cast<eleveldb_priv_data *>(enif_priv_data(env));
-
-        if(false == priv.thread_pool.Submit(work_item))
-        {
-            delete work_item;
-            return send_reply(env, caller_ref, enif_make_tuple2(env, ATOM_ERROR, caller_ref));
-        }   // if
     }   // if
     else if (!term_ok)
     {
@@ -1093,7 +1098,6 @@ async_iterator_close(
 
     if(NULL==itr_ptr.get() || 0!=itr_ptr->GetCloseRequested())
     {
-       leveldb::gPerfCounters->Inc(leveldb::ePerfDebug4);
        return enif_make_badarg(env);
     }
 
@@ -1106,15 +1110,7 @@ async_iterator_close(
     {
         eleveldb::WorkTask *work_item = new eleveldb::ItrCloseTask(env, caller_ref,
                                                                    itr_ptr);
-
-        // Now-boilerplate setup (we'll consolidate this pattern soon, I hope):
-        eleveldb_priv_data& priv = *static_cast<eleveldb_priv_data *>(enif_priv_data(env));
-
-        if(false == priv.thread_pool.Submit(work_item))
-        {
-            delete work_item;
-            return send_reply(env, caller_ref, enif_make_tuple2(env, ATOM_ERROR, caller_ref));
-        }   // if
+        return submit_to_thread_queue(work_item, env, caller_ref);
     }   // if
 
     // this close/cleanup call is way late ... bad programmer!
@@ -1144,24 +1140,14 @@ async_destroy(
 
     ERL_NIF_TERM caller_ref = argv[0];
 
-    eleveldb_priv_data& priv = *static_cast<eleveldb_priv_data *>(enif_priv_data(env));
-
     leveldb::Options *opts = new leveldb::Options;
     fold(env, argv[2], parse_open_option, *opts);
 
     eleveldb::WorkTask *work_item = new eleveldb::DestroyTask(env, caller_ref,
                                                               db_name, opts);
-
-    if(false == priv.thread_pool.Submit(work_item))
-    {
-        delete work_item;
-        return send_reply(env, caller_ref,
-                          enif_make_tuple2(env, eleveldb::ATOM_ERROR, caller_ref));
-    }
-
-    return eleveldb::ATOM_OK;
-
+    return submit_to_thread_queue(work_item, env, caller_ref);
 }   // async_destroy
+
 
 } // namespace eleveldb
 
@@ -1286,11 +1272,16 @@ eleveldb_is_empty(
 
 static void on_unload(ErlNifEnv *env, void *priv_data)
 {
+    // disable service request messages
+    eleveldb::gBucketPropCallback.Disable();
+
+    leveldb::Env::Shutdown();
+
     eleveldb_priv_data *p = static_cast<eleveldb_priv_data *>(priv_data);
     delete p;
 
-    leveldb::Env::Shutdown();
-}
+    return;
+}   // on_unload
 
 
 static int on_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
@@ -1370,24 +1361,41 @@ try
     ATOM(eleveldb::ATOM_TIERED_SLOW_PREFIX, "tiered_slow_prefix");
     ATOM(eleveldb::ATOM_ANTIDOTE, "antidote");
     ATOM(eleveldb::ATOM_CACHE_OBJECT_WARMING, "cache_object_warming");
+    ATOM(eleveldb::ATOM_EXPIRATION, "expiration");
+    ATOM(eleveldb::ATOM_DEFAULT_TIME_TO_LIVE, "default_time_to_live");
+    ATOM(eleveldb::ATOM_EXPIRATION_MODE, "expiration_mode");
+    ATOM(eleveldb::ATOM_ENABLED, "enabled");
+    ATOM(eleveldb::ATOM_WHOLE_FILE, "whole_file");
+    ATOM(eleveldb::ATOM_PER_ITEM, "per_item");
+    ATOM(eleveldb::ATOM_INVOKE, "invoke");
+    ATOM(eleveldb::ATOM_UNLIMITED, "unlimited");
     ATOM(eleveldb::ATOM_EXPIRY_ENABLED, "expiry_enabled");
     ATOM(eleveldb::ATOM_EXPIRY_MINUTES, "expiry_minutes");
     ATOM(eleveldb::ATOM_WHOLE_FILE_EXPIRY, "whole_file_expiry");
+    ATOM(eleveldb::ATOM_BUCKET_PROPS, "bucket_props");
 #undef ATOM
+
+    ERL_NIF_TERM option_list;
+    bool good_params(false);
+
+    if (enif_is_list(env, load_info))
+    {
+        option_list=load_info;
+        good_params=true;
+    }   // if
 
 
     // read options that apply to global eleveldb environment
-    if(enif_is_list(env, load_info))
+    if(good_params)
     {
         EleveldbOptions load_options;
 
-        fold(env, load_info, parse_init_option, load_options);
+        fold(env, option_list, parse_init_option, load_options);
 
         /* Spin up the thread pool, set up all private data: */
         eleveldb_priv_data *priv = new eleveldb_priv_data(load_options);
 
         *priv_data = priv;
-
     }   // if
 
     else
